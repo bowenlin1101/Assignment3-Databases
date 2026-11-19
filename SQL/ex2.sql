@@ -11,7 +11,8 @@
 CREATE DATABASE IF NOT EXISTS amazon_tracker;
 USE amazon_tracker;
 
-DROP VIEW IF EXISTS ActiveProducts;
+DROP VIEW IF EXISTS OrderStatusView;
+DROP VIEW IF EXISTS ActiveProductCatalog;
 DROP TABLE IF EXISTS SourcingPurchase;
 DROP TABLE IF EXISTS Refund;
 DROP TABLE IF EXISTS Inventory;
@@ -44,6 +45,8 @@ CREATE TABLE Customer (
 
 -- ============================================================
 -- 2. CustomerAddress  (multi-valued composite attribute SavedAddresses)
+-- There is no default address: the customer picks one (or enters a
+-- new one, which is saved here) every time they place an order.
 -- ============================================================
 CREATE TABLE CustomerAddress (
     customerID INT          NOT NULL,
@@ -82,6 +85,9 @@ CREATE TABLE SupplierPhone (
 
 -- ============================================================
 -- 5. Product  (Product + ProductListing merged, mandatory 1:1)
+-- listingStatus only records whether the supplier has the listing
+-- up (Active) or has removed it (Inactive). Whether a product is in
+-- stock is derived from Inventory, so it is never stored twice.
 -- ============================================================
 CREATE TABLE Product (
     productID     INT           PRIMARY KEY,
@@ -93,15 +99,18 @@ CREATE TABLE Product (
     listingName   VARCHAR(255)  NOT NULL,
     listingPrice  DECIMAL(10,2) NOT NULL,
     listingStatus VARCHAR(50)   NOT NULL,
+    listingDate   DATE          NOT NULL,
     -- POSTS is a composition: deleting a supplier removes its listings
     FOREIGN KEY (supplierID) REFERENCES Supplier(supplierID)
         ON DELETE CASCADE,
     CHECK (listingPrice >= 0),
-    CHECK (listingStatus IN ('Active', 'Inactive', 'OutOfStock'))
+    CHECK (listingStatus IN ('Active', 'Inactive'))
 );
 
 -- ============================================================
 -- 6. Facility  (superclass of Factory and Storage)
+-- Warehouses are all in Canada; factories can be abroad, so the
+-- province column holds the province / state / region.
 -- ============================================================
 CREATE TABLE Facility (
     facilityID         INT          PRIMARY KEY,
@@ -110,6 +119,7 @@ CREATE TABLE Facility (
     city               VARCHAR(100) NOT NULL,
     province           VARCHAR(100) NOT NULL,
     postalCode         VARCHAR(20)  NOT NULL,
+    country            VARCHAR(100) NOT NULL DEFAULT 'Canada',
     storageCapacity    INT          NOT NULL,
     contactPhoneNumber VARCHAR(20),
     CHECK (storageCapacity >= 0)
@@ -122,7 +132,7 @@ CREATE TABLE Factory (
     facilityID         INT          PRIMARY KEY,
     productionCapacity INT          NOT NULL,
     productionType     VARCHAR(100),
-    productionLeadTime INT,
+    productionLeadTime INT,                         -- days
     FOREIGN KEY (facilityID) REFERENCES Facility(facilityID)
         ON DELETE CASCADE,
     CHECK (productionCapacity >= 0),
@@ -134,7 +144,7 @@ CREATE TABLE Factory (
 -- ============================================================
 CREATE TABLE Storage (
     facilityID              INT PRIMARY KEY,
-    orderProcessingCapacity INT NOT NULL,
+    orderProcessingCapacity INT NOT NULL,           -- orders per day
     FOREIGN KEY (facilityID) REFERENCES Facility(facilityID)
         ON DELETE CASCADE,
     CHECK (orderProcessingCapacity >= 0)
@@ -147,32 +157,41 @@ CREATE TABLE Carrier (
     carrierID          INT          PRIMARY KEY,
     carrierName        VARCHAR(255) NOT NULL,
     carrierType        VARCHAR(100),
+    trackingWebsite    VARCHAR(255),
     contactPhoneNumber VARCHAR(20)
 );
 
 -- ============================================================
 -- 10. DeliveryTier  (split out of Orders during normalization)
+-- deliveryDays gives the estimated delivery date:
+--   estimatedDeliveryDate = orderDate + deliveryDays
 -- ============================================================
 CREATE TABLE DeliveryTier (
     deliveryTier VARCHAR(50)   PRIMARY KEY,
     shippingFee  DECIMAL(10,2) NOT NULL,
-    CHECK (shippingFee >= 0)
+    deliveryDays INT           NOT NULL,
+    CHECK (shippingFee >= 0),
+    CHECK (deliveryDays > 0)
 );
 
 -- ============================================================
 -- 11. OrderShipment  (subclass of Shipment)
+-- trackingNumber is what the carrier prints on the package; customers
+-- can look a package up by it or by order ID.
 -- ============================================================
 CREATE TABLE OrderShipment (
-    shipmentID INT      PRIMARY KEY,
-    timeSent   DATETIME NOT NULL,
-    storageID  INT      NOT NULL,
-    carrierID  INT      NOT NULL,
+    shipmentID     INT         PRIMARY KEY,
+    trackingNumber VARCHAR(30) NOT NULL UNIQUE,
+    timeSent       DATETIME    NOT NULL,
+    storageID      INT         NOT NULL,
+    carrierID      INT         NOT NULL,
     FOREIGN KEY (storageID) REFERENCES Storage(facilityID),
     FOREIGN KEY (carrierID) REFERENCES Carrier(carrierID)
 );
 
 -- ============================================================
 -- 12. InventoryShipment  (subclass of Shipment)
+-- timeArrived is NULL while the shipment is still in transit.
 -- ============================================================
 CREATE TABLE InventoryShipment (
     shipmentID            INT      PRIMARY KEY,
@@ -190,6 +209,10 @@ CREATE TABLE InventoryShipment (
 
 -- ============================================================
 -- 13. Orders  (ORDER is a reserved word)
+-- Status is derived, never stored:
+--   shipmentID IS NULL           -> Processing
+--   actualDeliveryDate IS NULL   -> Shipped
+--   otherwise                    -> Delivered
 -- ============================================================
 CREATE TABLE Orders (
     orderID               INT          PRIMARY KEY,
@@ -245,6 +268,7 @@ CREATE TABLE InventoryShipmentContains (
 
 -- ============================================================
 -- 16. Inventory  (M:N Facility - Product)
+-- Kept up to date by the triggers at the end of this file.
 -- ============================================================
 CREATE TABLE Inventory (
     facilityID        INT NOT NULL,
@@ -260,8 +284,9 @@ CREATE TABLE Inventory (
 
 -- ============================================================
 -- 17. Refund
--- The composite FK guarantees the refunded product was actually
--- part of that order.
+-- Refunds are processed immediately, so there is no status: a row
+-- here means the money was returned. The composite FK guarantees the
+-- refunded product was actually part of that order.
 -- ============================================================
 CREATE TABLE Refund (
     orderID        INT           NOT NULL,
@@ -269,7 +294,6 @@ CREATE TABLE Refund (
     refundNumber   INT           NOT NULL,
     refundDate     DATE          NOT NULL,
     refundReason   VARCHAR(500),
-    refundStatus   VARCHAR(50)   NOT NULL,
     refundQuantity INT           NOT NULL,
     refundAmount   DECIMAL(10,2) NOT NULL,
     PRIMARY KEY (orderID, productID, refundNumber),
@@ -277,20 +301,22 @@ CREATE TABLE Refund (
         ON DELETE CASCADE,
     CHECK (refundNumber > 0),
     CHECK (refundQuantity > 0),
-    CHECK (refundAmount >= 0),
-    CHECK (refundStatus IN ('Requested', 'Approved', 'Rejected', 'Completed'))
+    CHECK (refundAmount >= 0)
 );
 
 -- ============================================================
 -- 18. SourcingPurchase
+-- A supplier buying stock from a factory (a restock). Purchases are
+-- accepted instantly. purchaseID is a surrogate key so the same product
+-- can be bought from the same factory more than once on one day.
 -- ============================================================
 CREATE TABLE SourcingPurchase (
+    purchaseID        INT           PRIMARY KEY,
     productID         INT           NOT NULL,
     factoryID         INT           NOT NULL,
     purchaseDate      DATE          NOT NULL,
     quantityPurchased INT           NOT NULL,
     unitCost          DECIMAL(10,2) NOT NULL,
-    PRIMARY KEY (productID, factoryID, purchaseDate),
     FOREIGN KEY (productID) REFERENCES Product(productID),
     FOREIGN KEY (factoryID) REFERENCES Factory(facilityID),
     CHECK (quantityPurchased > 0),
@@ -303,25 +329,195 @@ CREATE TABLE SourcingPurchase (
 --  automatically; these support the common search paths.)
 -- ============================================================
 CREATE INDEX idx_product_category_status ON Product (category, listingStatus);
+CREATE INDEX idx_product_listing_date    ON Product (listingDate);
 CREATE INDEX idx_orders_date             ON Orders (orderDate);
 CREATE INDEX idx_customer_name           ON Customer (lastName, firstName);
+CREATE INDEX idx_sourcing_date           ON SourcingPurchase (purchaseDate);
 
 -- ============================================================
--- Trigger: the total quantity refunded for one product in one
--- order can never exceed the quantity that was ordered.
--- A CHECK constraint cannot do this because it needs to look at
--- other rows (earlier partial refunds) and another table.
+-- Triggers: keep Inventory in step with everything that moves stock.
+--
+--   SourcingPurchase inserted       -> stock added at the factory
+--   InventoryShipmentContains row   -> stock leaves the origin facility
+--   InventoryShipment arrives       -> stock added at the destination
+--   Order gets a shipment (ships)   -> stock leaves the warehouse
+--   Refund inserted                 -> stock goes back to that warehouse
+--
+-- Stock is taken when an order ships, not when it is placed, because
+-- the warehouse is only chosen when the order is assembled.
+--
+-- SRC/load_data.sql loads a finished history whose Inventory rows are
+-- already correct, so it sets @bulk_load = 1 to switch the stock
+-- updates off while it runs. The validation checks always run.
 -- ============================================================
 DELIMITER $$
 
-CREATE TRIGGER trg_refund_quantity_limit
+-- A purchase from a factory adds the stock at that factory.
+CREATE TRIGGER trg_sourcing_add_stock
+AFTER INSERT ON SourcingPurchase
+FOR EACH ROW
+BEGIN
+    IF @bulk_load IS NULL THEN
+        IF EXISTS (SELECT 1 FROM Inventory
+                   WHERE facilityID = NEW.factoryID AND productID = NEW.productID) THEN
+            UPDATE Inventory
+            SET quantityAvailable = quantityAvailable + NEW.quantityPurchased
+            WHERE facilityID = NEW.factoryID AND productID = NEW.productID;
+        ELSE
+            INSERT INTO Inventory (facilityID, productID, quantityAvailable)
+            VALUES (NEW.factoryID, NEW.productID, NEW.quantityPurchased);
+        END IF;
+    END IF;
+END$$
+
+-- Loading a product onto an inventory shipment takes it out of the
+-- origin facility (it is in transit, so it is in neither facility).
+-- If the shipment is already marked as arrived, it is added at the
+-- destination straight away.
+CREATE TRIGGER trg_inventory_shipment_load
+AFTER INSERT ON InventoryShipmentContains
+FOR EACH ROW
+BEGIN
+    DECLARE originID  INT;
+    DECLARE destID    INT;
+    DECLARE arrived   DATETIME;
+    DECLARE onHand    INT DEFAULT NULL;
+
+    IF @bulk_load IS NULL THEN
+        SELECT originFacilityID, destinationFacilityID, timeArrived
+        INTO originID, destID, arrived
+        FROM InventoryShipment
+        WHERE shipmentID = NEW.shipmentID;
+
+        SELECT quantityAvailable INTO onHand
+        FROM Inventory
+        WHERE facilityID = originID AND productID = NEW.productID;
+
+        IF onHand IS NULL OR onHand < NEW.quantity THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Origin facility does not have enough stock for this shipment';
+        END IF;
+
+        UPDATE Inventory
+        SET quantityAvailable = quantityAvailable - NEW.quantity
+        WHERE facilityID = originID AND productID = NEW.productID;
+
+        IF arrived IS NOT NULL THEN
+            IF EXISTS (SELECT 1 FROM Inventory
+                       WHERE facilityID = destID AND productID = NEW.productID) THEN
+                UPDATE Inventory
+                SET quantityAvailable = quantityAvailable + NEW.quantity
+                WHERE facilityID = destID AND productID = NEW.productID;
+            ELSE
+                INSERT INTO Inventory (facilityID, productID, quantityAvailable)
+                VALUES (destID, NEW.productID, NEW.quantity);
+            END IF;
+        END IF;
+    END IF;
+END$$
+
+-- When an in-transit inventory shipment arrives, everything on it is
+-- added at the destination facility.
+CREATE TRIGGER trg_inventory_shipment_arrive
+AFTER UPDATE ON InventoryShipment
+FOR EACH ROW
+BEGIN
+    IF OLD.timeArrived IS NULL AND NEW.timeArrived IS NOT NULL THEN
+        UPDATE Inventory
+        SET quantityAvailable = quantityAvailable + (
+            SELECT isc.quantity
+            FROM InventoryShipmentContains isc
+            WHERE isc.shipmentID = NEW.shipmentID
+              AND isc.productID = Inventory.productID)
+        WHERE facilityID = NEW.destinationFacilityID
+          AND productID IN (SELECT productID FROM InventoryShipmentContains
+                            WHERE shipmentID = NEW.shipmentID);
+
+        INSERT INTO Inventory (facilityID, productID, quantityAvailable)
+        SELECT NEW.destinationFacilityID, isc.productID, isc.quantity
+        FROM InventoryShipmentContains isc
+        WHERE isc.shipmentID = NEW.shipmentID
+          AND NOT EXISTS (SELECT 1 FROM Inventory i
+                          WHERE i.facilityID = NEW.destinationFacilityID
+                            AND i.productID = isc.productID);
+    END IF;
+END$$
+
+-- An order ships when it is given a shipment. Every product in it must
+-- be in stock at the shipment's warehouse; the stock is then taken.
+-- An order that has shipped cannot be moved to another shipment.
+CREATE TRIGGER trg_order_ship
+BEFORE UPDATE ON Orders
+FOR EACH ROW
+BEGIN
+    DECLARE warehouseID INT;
+    DECLARE shortLines  INT;
+
+    IF OLD.shipmentID IS NOT NULL
+       AND (NEW.shipmentID IS NULL OR NEW.shipmentID <> OLD.shipmentID) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'An order that has shipped cannot change shipment';
+    END IF;
+
+    IF OLD.shipmentID IS NULL AND NEW.shipmentID IS NOT NULL THEN
+        SELECT storageID INTO warehouseID
+        FROM OrderShipment
+        WHERE shipmentID = NEW.shipmentID;
+
+        SELECT COUNT(*) INTO shortLines
+        FROM OrderContains oc
+        WHERE oc.orderID = NEW.orderID
+          AND NOT EXISTS (SELECT 1 FROM Inventory i
+                          WHERE i.facilityID = warehouseID
+                            AND i.productID = oc.productID
+                            AND i.quantityAvailable >= oc.quantity);
+
+        IF shortLines > 0 THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Warehouse does not have enough stock to ship this order';
+        END IF;
+
+        UPDATE Inventory
+        SET quantityAvailable = quantityAvailable - (
+            SELECT oc.quantity
+            FROM OrderContains oc
+            WHERE oc.orderID = NEW.orderID
+              AND oc.productID = Inventory.productID)
+        WHERE facilityID = warehouseID
+          AND productID IN (SELECT productID FROM OrderContains
+                            WHERE orderID = NEW.orderID);
+    END IF;
+END$$
+
+-- A refund is only allowed on a delivered order, on or after the
+-- delivery date. The total quantity refunded for one product in one
+-- order can never exceed the quantity ordered, and the money returned
+-- can never exceed what was paid for the refunded units. A CHECK
+-- constraint cannot do this because it needs other rows and tables.
+CREATE TRIGGER trg_refund_validate
 BEFORE INSERT ON Refund
 FOR EACH ROW
 BEGIN
     DECLARE orderedQty  INT;
+    DECLARE unitPrice   DECIMAL(10,2);
     DECLARE refundedQty INT;
+    DECLARE deliveredOn DATE;
 
-    SELECT quantity INTO orderedQty
+    SELECT actualDeliveryDate INTO deliveredOn
+    FROM Orders
+    WHERE orderID = NEW.orderID;
+
+    IF deliveredOn IS NULL THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Only delivered orders can be refunded';
+    END IF;
+
+    IF NEW.refundDate < deliveredOn THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Refund date is before the delivery date';
+    END IF;
+
+    SELECT quantity, unitPriceAtPurchase INTO orderedQty, unitPrice
     FROM OrderContains
     WHERE orderID = NEW.orderID AND productID = NEW.productID;
 
@@ -332,6 +528,36 @@ BEGIN
     IF refundedQty + NEW.refundQuantity > orderedQty THEN
         SIGNAL SQLSTATE '45000'
             SET MESSAGE_TEXT = 'Refund quantity exceeds quantity ordered';
+    END IF;
+
+    IF NEW.refundAmount > NEW.refundQuantity * unitPrice THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Refund amount exceeds the price paid';
+    END IF;
+END$$
+
+-- Refunded items go back into stock at the warehouse that shipped them.
+CREATE TRIGGER trg_refund_restock
+AFTER INSERT ON Refund
+FOR EACH ROW
+BEGIN
+    DECLARE warehouseID INT;
+
+    IF @bulk_load IS NULL THEN
+        SELECT s.storageID INTO warehouseID
+        FROM Orders o
+        JOIN OrderShipment s ON s.shipmentID = o.shipmentID
+        WHERE o.orderID = NEW.orderID;
+
+        IF EXISTS (SELECT 1 FROM Inventory
+                   WHERE facilityID = warehouseID AND productID = NEW.productID) THEN
+            UPDATE Inventory
+            SET quantityAvailable = quantityAvailable + NEW.refundQuantity
+            WHERE facilityID = warehouseID AND productID = NEW.productID;
+        ELSE
+            INSERT INTO Inventory (facilityID, productID, quantityAvailable)
+            VALUES (warehouseID, NEW.productID, NEW.refundQuantity);
+        END IF;
     END IF;
 END$$
 
